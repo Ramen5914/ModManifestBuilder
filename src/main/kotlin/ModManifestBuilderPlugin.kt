@@ -1,24 +1,133 @@
 package games.ramen
 
+import com.reposilite.maven.MavenFacade
 import com.reposilite.maven.api.DeployEvent
 import com.reposilite.plugin.api.Facade
 import com.reposilite.plugin.api.Plugin
 import com.reposilite.plugin.api.ReposiliteDisposeEvent
 import com.reposilite.plugin.api.ReposiliteInitializeEvent
 import com.reposilite.plugin.api.ReposilitePlugin
+import com.reposilite.plugin.api.ReposiliteStartedEvent
 import com.reposilite.plugin.event
 import com.reposilite.web.api.ReposiliteRoute
 import com.reposilite.web.api.ReposiliteRoutes
 import com.reposilite.web.api.RoutingSetupEvent
 import com.reposilite.web.routing.RouteMethod
 import io.javalin.http.HandlerType
+import java.time.Duration
+import java.time.ZonedDateTime
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.time.ZoneId
 
 @Plugin(name = "mod-manifest-builder")
 class ModManifestBuilderPlugin : ReposilitePlugin() {
 
     override fun initialize(): Facade? {
+        val parser = ArtifactManifestParser { message ->
+            logger.info(message)
+        }
+
+        val scanner = RepositoryManifestScanner(parser)
+
+        val scheduler = Executors.newSingleThreadScheduledExecutor { task ->
+            Thread(task, "mod-manifest-reconciliation").apply {
+                isDaemon = true
+            }
+        }
+
         val webhook = ManifestWebhook { message ->
             logger.info(message)
+        }
+
+        event { _: ReposiliteStartedEvent ->
+            val mavenFacade = extensions().facade<MavenFacade>()
+
+            val zone = ZoneId.of(
+                System.getenv("MOD_MANIFEST_TIMEZONE")
+                    ?: "America/Los_Angeles"
+            )
+
+            fun runFullUpdate() {
+                try {
+                    val repository = mavenFacade.getRepositories()
+                        .firstOrNull { it.name == "releases" }
+                        ?: error("Repository 'releases' was not found")
+
+                    logger.info("Manifest: starting full repository scan")
+
+                    val builds = scanner.scan(repository)
+
+                    logger.info(
+                        "Manifest: full scan completed: " +
+                                "${builds.size} builds across " +
+                                "${builds.map { it.mod }.distinct().size} mods"
+                    )
+
+                    webhook.enqueueReconciliation(builds)
+                } catch (error: Exception) {
+                    logger.info(
+                        "Manifest: full update failed:\n" +
+                                error.stackTraceToString()
+                    )
+                }
+            }
+
+            fun scheduleNextMidnight() {
+                if (scheduler.isShutdown) {
+                    return
+                }
+
+                val now = ZonedDateTime.now(zone)
+
+                val nextMidnight = now.toLocalDate()
+                    .plusDays(1)
+                    .atStartOfDay(zone)
+
+                val delayMillis = Duration.between(
+                    now.toInstant(),
+                    nextMidnight.toInstant()
+                ).toMillis()
+
+                logger.info(
+                    "Manifest: next daily update scheduled for $nextMidnight"
+                )
+
+                try {
+                    scheduler.schedule(
+                        {
+                            try {
+                                runFullUpdate()
+                            } finally {
+                                scheduleNextMidnight()
+                            }
+                        },
+                        delayMillis,
+                        TimeUnit.MILLISECONDS
+                    )
+                } catch (error: java.util.concurrent.RejectedExecutionException) {
+                    // Shutdown can occur between the check and scheduling.
+                    if (!scheduler.isShutdown) {
+                        throw error
+                    }
+                }
+            }
+
+            logger.info(
+                "Manifest: startup update scheduled in 30 seconds"
+            )
+
+            scheduler.schedule(
+                {
+                    try {
+                        runFullUpdate()
+                    } finally {
+                        scheduleNextMidnight()
+                    }
+                },
+                30L,
+                TimeUnit.SECONDS
+            )
         }
 
         event { _: ReposiliteInitializeEvent ->
@@ -26,6 +135,7 @@ class ModManifestBuilderPlugin : ReposilitePlugin() {
         }
 
         event { _: ReposiliteDisposeEvent ->
+            scheduler.shutdownNow()
             webhook.close()
         }
 
@@ -43,7 +153,7 @@ class ModManifestBuilderPlugin : ReposilitePlugin() {
                     "Manifest: skipped repository '$repository'"
                 )
             } else {
-                val update = parseArtifactPath(
+                val update = parser.parse(
                     operation = "upsert",
                     artifactPath = artifactPath
                 )
@@ -82,7 +192,7 @@ class ModManifestBuilderPlugin : ReposilitePlugin() {
                                 val artifactPath =
                                     requestPath.removePrefix(repositoryPrefix)
 
-                                val update = parseArtifactPath(
+                                val update = parser.parse(
                                     operation = "remove",
                                     artifactPath = artifactPath
                                 )
@@ -107,98 +217,5 @@ class ModManifestBuilderPlugin : ReposilitePlugin() {
         }
 
         return null
-    }
-
-    private fun parseArtifactPath(
-        operation: String,
-        artifactPath: String
-    ): ManifestUpdate? {
-        // Expected:
-        // games/ramen/{mod}/{version}/
-        // {mod}-{version}-{loader}-{minecraftVersion}.jar
-
-        val parts = artifactPath.trim('/').split('/')
-
-        if (parts.size != 5) return null
-        if (parts[0] != "games" || parts[1] != "ramen") return null
-
-        val mod = parts[2]
-        val version = parts[3]
-        val filename = parts[4]
-
-        if (!MOD_PATTERN.matches(mod)) return null
-        if (!VERSION_PATTERN.matches(version)) return null
-
-        val filenamePrefix = "$mod-$version-"
-
-        if (!filename.startsWith(filenamePrefix)) return null
-        if (!filename.endsWith(".jar")) return null
-
-        val classifier = filename
-            .removePrefix(filenamePrefix)
-            .removeSuffix(".jar")
-
-        val separator = classifier.indexOf('-')
-
-        if (separator <= 0) return null
-
-        val loader = classifier.substring(0, separator)
-        val minecraftVersion = classifier.substring(separator + 1)
-
-        if (loader !in SUPPORTED_LOADERS) return null
-
-        // Only accept numeric Minecraft versions here.
-        // This also excludes suffixes such as "-sources".
-        if (!MINECRAFT_VERSION_PATTERN.matches(minecraftVersion)) {
-            return null
-        }
-
-        val channel = when {
-            version.contains(
-                Regex("""-alpha(?:[.-].*)?$""", RegexOption.IGNORE_CASE)
-            ) -> "alpha"
-
-            version.contains(
-                Regex("""-beta(?:[.-].*)?$""", RegexOption.IGNORE_CASE)
-            ) -> "beta"
-
-            RELEASE_VERSION_PATTERN.matches(version) -> "release"
-
-            else -> {
-                logger.info(
-                    "Manifest: unsupported version channel: $version"
-                )
-                return null
-            }
-        }
-
-        return ManifestUpdate(
-            operation = operation,
-            mod = mod,
-            minecraftVersion = minecraftVersion,
-            loader = loader,
-            channel = channel,
-            version = version
-        )
-    }
-
-    private companion object {
-        val SUPPORTED_LOADERS = setOf(
-            "neoforge",
-            "forge",
-            "fabric",
-            "quilt"
-        )
-
-        val MOD_PATTERN = Regex("""[a-zA-Z0-9_-]{1,128}""")
-
-        val VERSION_PATTERN =
-            Regex("""[a-zA-Z0-9._+-]{1,128}""")
-
-        val MINECRAFT_VERSION_PATTERN =
-            Regex("""[0-9]+(?:\.[0-9]+){1,3}""")
-
-        val RELEASE_VERSION_PATTERN =
-            Regex("""[0-9]+\.[0-9]+\.[0-9]+(?:\+[a-zA-Z0-9.-]+)?""")
     }
 }

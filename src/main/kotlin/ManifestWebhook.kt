@@ -62,15 +62,24 @@ class ManifestWebhook(
     }
 
     private fun deliver(update: ManifestUpdate) {
+        deliverJson(
+            body = update.toJson(),
+            description =
+                "${update.operation} " +
+                        "${update.mod}/${update.minecraftVersion}/" +
+                        "${update.loader}/${update.version}"
+        )
+    }
+
+    private fun deliverJson(
+        body: String,
+        description: String
+    ) {
         val request = HttpRequest.newBuilder(endpoint)
             .timeout(Duration.ofSeconds(15))
             .header("Authorization", "Bearer $secret")
             .header("Content-Type", "application/json")
-            .POST(
-                HttpRequest.BodyPublishers.ofString(
-                    update.toJson()
-                )
-            )
+            .POST(HttpRequest.BodyPublishers.ofString(body))
             .build()
 
         for (attempt in 1..3) {
@@ -84,20 +93,19 @@ class ManifestWebhook(
 
                 if (status in 200..299) {
                     log(
-                        "Manifest ${update.operation} succeeded: " +
-                                "${update.mod}/${update.minecraftVersion}/" +
-                                "${update.loader}/${update.version}"
+                        "Manifest webhook succeeded: $description; " +
+                                "response=${response.body().take(500)}"
                     )
                     return
                 }
 
                 log(
-                    "Manifest webhook returned HTTP $status: " +
+                    "Manifest webhook returned HTTP $status " +
+                            "for $description: " +
                             response.body().take(500)
                 )
 
-                // Retry temporary failures, not invalid payloads
-                // or authentication/configuration failures.
+                // Only retry temporary HTTP failures.
                 if (
                     status != 408 &&
                     status != 429 &&
@@ -110,7 +118,8 @@ class ManifestWebhook(
             } catch (error: Exception) {
                 log(
                     "Manifest webhook attempt $attempt failed " +
-                            "for $endpoint:\n${error.stackTraceToString()}"
+                            "for $endpoint ($description):\n" +
+                            error.stackTraceToString()
                 )
             }
 
@@ -120,10 +129,53 @@ class ManifestWebhook(
         }
 
         log(
-            "Manifest webhook delivery exhausted retries: " +
-                    "${update.mod}/${update.version}"
+            "Manifest webhook delivery exhausted retries: $description"
         )
     }
+
+    fun enqueueReconciliation(builds: List<ManifestUpdate>) {
+        // Capture a copy before handing the snapshot to the worker.
+        val snapshot = builds.toList()
+
+        worker.submit {
+            try {
+                val body = snapshot.joinToString(
+                    separator = ",",
+                    prefix = """{"operation":"reconcile","builds":[""",
+                    postfix = "]}"
+                ) { build ->
+                    build.toBuildJson()
+                }
+
+                deliverJson(
+                    body = body,
+                    description = "reconciliation (${snapshot.size} builds)"
+                )
+            } catch (error: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } catch (error: Exception) {
+                log(
+                    "Manifest reconciliation failed:\n" +
+                            error.stackTraceToString()
+                )
+            }
+        }
+    }
+
+    private fun ManifestUpdate.toBuildJson(): String =
+        listOf(
+            "mod" to mod,
+            "minecraftVersion" to minecraftVersion,
+            "loader" to loader,
+            "channel" to channel,
+            "version" to version
+        ).joinToString(
+            separator = ",",
+            prefix = "{",
+            postfix = "}"
+        ) { (key, value) ->
+            "${jsonString(key)}:${jsonString(value)}"
+        }
 
     override fun close() {
         worker.shutdown()
