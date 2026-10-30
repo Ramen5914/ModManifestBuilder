@@ -1,6 +1,7 @@
 package games.ramen
 
 import com.reposilite.maven.Repository
+import com.reposilite.storage.api.DocumentInfo
 import com.reposilite.storage.api.DirectoryInfo
 import com.reposilite.storage.api.FileType
 import com.reposilite.storage.api.Location
@@ -28,7 +29,30 @@ class RepositoryManifestScanner(
                     parser.parse(
                         operation = "upsert",
                         artifactPath = location.toString()
-                    )?.let { builds.add(it) }
+                    )?.let { update ->
+                        val sizeBytes =
+                            (details as? DocumentInfo)?.contentLength
+                                ?.takeIf { it >= 0L }
+
+                        val uploadedAt = repository.getLastModifiedTime(
+                            location
+                        ).fold(
+                            { it.toInstant().toString() },
+                            { error ->
+                                throw IllegalStateException(
+                                    "Cannot inspect last modified time for " +
+                                            "${repository.name}/$location: $error"
+                                )
+                            }
+                        )
+
+                        builds.add(
+                            update.copy(
+                                uploadedAt = uploadedAt,
+                                sizeBytes = sizeBytes
+                            )
+                        )
+                    }
                 }
 
                 FileType.DIRECTORY -> {
