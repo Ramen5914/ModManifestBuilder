@@ -13,7 +13,9 @@ data class ManifestUpdate(
     val minecraftVersion: String,
     val loader: String,
     val channel: String,
-    val version: String
+    val version: String,
+    val uploadedAt: String? = null,
+    val sizeBytes: Long? = null
 )
 
 class ManifestWebhook(
@@ -163,18 +165,20 @@ class ManifestWebhook(
     }
 
     private fun ManifestUpdate.toBuildJson(): String =
-        listOf(
+        listOfNotNull(
             "mod" to mod,
             "minecraftVersion" to minecraftVersion,
             "loader" to loader,
             "channel" to channel,
-            "version" to version
+            "version" to version,
+            uploadedAt?.let { "uploadedAt" to it },
+            sizeBytes?.let { "sizeBytes" to it }
         ).joinToString(
             separator = ",",
             prefix = "{",
             postfix = "}"
         ) { (key, value) ->
-            "${jsonString(key)}:${jsonString(value)}"
+            "${jsonString(key)}:${jsonValue(value)}"
         }
 
     override fun close() {
@@ -211,17 +215,27 @@ private fun jsonString(value: String): String = buildString {
 }
 
 private fun ManifestUpdate.toJson(): String =
-    listOf(
+    listOfNotNull(
         "operation" to operation,
         "mod" to mod,
         "minecraftVersion" to minecraftVersion,
         "loader" to loader,
         "channel" to channel,
-        "version" to version
+        "version" to version,
+        uploadedAt?.let { "uploadedAt" to it },
+        sizeBytes?.let { "sizeBytes" to it }
     ).joinToString(
         separator = ",",
         prefix = "{",
         postfix = "}"
     ) { (key, value) ->
-        "${jsonString(key)}:${jsonString(value)}"
+        "${jsonString(key)}:${jsonValue(value)}"
+    }
+
+private fun jsonValue(value: Any?): String =
+    when (value) {
+        null -> "null"
+        is Number -> value.toString()
+        is String -> jsonString(value)
+        else -> error("Unsupported JSON value: ${value::class}")
     }

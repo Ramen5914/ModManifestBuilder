@@ -9,16 +9,18 @@ import com.reposilite.plugin.api.ReposiliteInitializeEvent
 import com.reposilite.plugin.api.ReposilitePlugin
 import com.reposilite.plugin.api.ReposiliteStartedEvent
 import com.reposilite.plugin.event
+import com.reposilite.storage.api.DocumentInfo
 import com.reposilite.web.api.ReposiliteRoute
 import com.reposilite.web.api.ReposiliteRoutes
 import com.reposilite.web.api.RoutingSetupEvent
 import com.reposilite.web.routing.RouteMethod
 import io.javalin.http.HandlerType
 import java.time.Duration
+import java.time.Instant
 import java.time.ZonedDateTime
+import java.time.ZoneId
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.time.ZoneId
 
 @Plugin(name = "mod-manifest-builder")
 class ModManifestBuilderPlugin : ReposilitePlugin() {
@@ -163,16 +165,45 @@ class ModManifestBuilderPlugin : ReposilitePlugin() {
                         "Manifest: skipped unmatched artifact '$artifactPath'"
                     )
                 } else {
-                    logger.info(
-                        "Manifest: queueing update " +
-                                "mod=${update.mod} " +
-                                "minecraftVersion=${update.minecraftVersion} " +
-                                "loader=${update.loader} " +
-                                "channel=${update.channel} " +
-                                "version=${update.version}"
+                    val uploadedAt = Instant.now().toString()
+                    val details = event.repository.getFileDetails(event.gav)
+                        .fold(
+                            { it },
+                            { error ->
+                                logger.info(
+                                    "Manifest: cannot read deployed file " +
+                                            "metadata for '$artifactPath': $error"
+                                )
+                                null
+                            }
+                        )
+
+                    val sizeBytes = (details as? DocumentInfo)?.contentLength
+                        ?.takeIf { it >= 0L }
+
+                    if (sizeBytes == null) {
+                        logger.info(
+                            "Manifest: file size unavailable for " +
+                                    "deployed artifact '$artifactPath'"
+                        )
+                    }
+
+                    val updateWithMetadata = update.copy(
+                        uploadedAt = uploadedAt,
+                        sizeBytes = sizeBytes
                     )
 
-                    webhook.enqueue(update)
+                    logger.info(
+                        "Manifest: queueing update " +
+                                "mod=${updateWithMetadata.mod} " +
+                                "minecraftVersion=${updateWithMetadata.minecraftVersion} " +
+                                "loader=${updateWithMetadata.loader} " +
+                                "channel=${updateWithMetadata.channel} " +
+                                "version=${updateWithMetadata.version} " +
+                                "sizeBytes=${updateWithMetadata.sizeBytes}"
+                    )
+
+                    webhook.enqueue(updateWithMetadata)
                 }
             }
         }
